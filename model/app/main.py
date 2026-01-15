@@ -2,34 +2,44 @@ from fastapi import FastAPI, HTTPException
 import joblib
 import pandas as pd
 import os
+from contextlib import asynccontextmanager
 from schemas import TenantScoreRequest
 
-# --- CONFIGURATION ---
-app = FastAPI(title="Tenant Risk Scoring AI")
-MODEL_PATH = "../models/tenant_risk_model.pkl"
-model = None
-
-# --- STARTUP: Load the Model ---
-@app.on_event("startup")
-def load_ai_model():
-    global model
+# --- GESTION DU CYCLE DE VIE (LIFESPAN) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Code exécuté au démarrage
+    MODEL_PATH = "model/models/tenant_risk_model.pkl"
+    
     if os.path.exists(MODEL_PATH):
-        model = joblib.load(MODEL_PATH)
+        app.state.model = joblib.load(MODEL_PATH)
         print("✅ Production Model Loaded Successfully.")
     else:
-        print("❌ CRITICAL WARNING: Model file not found. Please run train_model.py first.")
+        app.state.model = None
+        print(f"❌ CRITICAL: Model file not found at {MODEL_PATH}")
+    
+    yield
+    # Code exécuté à l'arrêt (si besoin)
+    print("Shutting down Tenant Risk API...")
 
-# --- PREDICTION ENDPOINT ---
+# --- CONFIGURATION ---
+app = FastAPI(title="Tenant Risk Scoring AI", lifespan=lifespan)
+
+# --- ROUTES ---
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "Online",
+        "model_loaded": app.state.model is not None
+    }
+
 @app.post("/predict/score")
 def predict_risk_score(data: TenantScoreRequest):
-    """
-    Input: { "missedPeriods": 2, "totalDisputes": 1 }
-    Output: { "trust_score": 12, "risk_category": "Risky", "recommendation": "Review Manually" }
-    """
-    if not model:
-        raise HTTPException(status_code=503, detail="AI Model is not loaded.")
+    if not app.state.model:
+        raise HTTPException(status_code=503, detail="AI Model is not loaded on server.")
 
-    # Automatic approval for perfect tenant data
+    # Approbation automatique pour les dossiers parfaits
     if data.missedPeriods == 0 and data.totalDisputes == 0:
         return {
             "trust_score": 100,
@@ -38,26 +48,22 @@ def predict_risk_score(data: TenantScoreRequest):
         }
 
     try:
-        # 1. Prepare Data for Model
-        # The column names MUST match the training data exactly.
+        # 1. Préparation des données
         features = {
             "missedPeriods": data.missedPeriods,
             "totalDisputes": data.totalDisputes
         }
-        
-        # Create a single-row DataFrame
         model_input = pd.DataFrame([features])
 
-        # 2. Make Prediction
-        # The model returns [Probability_Bad, Probability_Good]
-        # We want the probability of "Good" (Index 1)
-        probs = model.predict_proba(model_input)
+        # 2. Prédiction des probabilités
+        # [Probabilité_Mauvais, Probabilité_Bon] -> On prend l'index 1 (Bon)
+        probs = app.state.model.predict_proba(model_input)
         trust_probability = probs[0][1] 
 
-        # 3. Convert to Integer Score (0-100)
+        # 3. Calcul du score (0-100)
         final_score = int(trust_probability * 100)
 
-        # 4. Determine Category & Recommendation
+        # 4. Catégorisation
         if final_score > 75:
             category = "Safe"
             recommendation = "Approve"
@@ -68,7 +74,6 @@ def predict_risk_score(data: TenantScoreRequest):
             category = "Moderate"
             recommendation = "Review Manually"
 
-        # 5. Return EXACT JSON Response requested
         return {
             "trust_score": final_score,
             "risk_category": category,
@@ -77,3 +82,9 @@ def predict_risk_score(data: TenantScoreRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction Error: {str(e)}")
+
+# --- LANCEMENT ---
+if __name__ == "__main__":
+    import uvicorn
+    # Port 8000 pour la cohérence avec le Dockerfile
+    uvicorn.run(app, host="0.0.0.0", port=8000)
